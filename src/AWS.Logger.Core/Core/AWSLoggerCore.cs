@@ -234,8 +234,10 @@ namespace AWS.Logger.Core
             }
         }
 
-        private void AddSingleMessage(string message)
+        private void AddSingleMessage(string message, DateTime? timestamp)
         {
+            DateTime timestampNn = timestamp ?? DateTime.Now;
+
             if (_pendingMessageQueue.Count > _config.MaxQueuedMessages)
             {
                 if (_maxBufferTimeStamp.AddMinutes(MAX_BUFFER_TIMEDIFF) < DateTime.UtcNow)
@@ -248,7 +250,7 @@ namespace AWS.Logger.Core
                     _maxBufferTimeStamp = DateTime.UtcNow;
                     _pendingMessageQueue.Enqueue(new InputLogEvent
                     {
-                        Timestamp = DateTime.Now,
+                        Timestamp = timestampNn,
                         Message = message,
                     });
                 }
@@ -257,7 +259,7 @@ namespace AWS.Logger.Core
             {
                 _pendingMessageQueue.Enqueue(new InputLogEvent
                 {
-                    Timestamp = DateTime.Now,
+                    Timestamp = timestampNn,
                     Message = message,
                 });
             }
@@ -268,7 +270,7 @@ namespace AWS.Logger.Core
         /// the logger
         /// </summary>
         /// <param name="rawMessage"></param>
-        public void AddMessage(string rawMessage)
+        public void AddMessage(string rawMessage, DateTime? timestamp = null)
         {
             if (string.IsNullOrEmpty(rawMessage))
             {
@@ -280,14 +282,14 @@ namespace AWS.Logger.Core
             // typically small messages.
             if (Encoding.Unicode.GetMaxByteCount(rawMessage.Length) < MAX_MESSAGE_SIZE_IN_BYTES)
             {
-                AddSingleMessage(rawMessage);
+                AddSingleMessage(rawMessage, timestamp);
             }
             else
             {
                 var messageParts = BreakupMessage(rawMessage);
                 foreach (var message in messageParts)
                 {
-                    AddSingleMessage(message);
+                    AddSingleMessage(message, timestamp);
                 }
             }
         }
