@@ -19,7 +19,7 @@
         /// Sends message to CloudWatch Logs
         /// </summary>
         /// <param name="message"></param>
-        void AddMessage(string message);
+        void AddMessage(string message, DateTime? timestamp);
 
         /// <summary>
         /// Start background task for sending messages to CloudWatch Logs
