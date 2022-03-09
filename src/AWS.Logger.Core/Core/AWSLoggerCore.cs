@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.IO;
@@ -15,6 +15,8 @@ using Amazon.CloudWatchLogs;
 using Amazon.CloudWatchLogs.Model;
 using Amazon.Runtime;
 using Amazon.Runtime.CredentialManagement;
+using Invantive.Basics;
+using Invantive.Basics.Messages;
 
 namespace AWS.Logger.Core
 {
@@ -26,18 +28,28 @@ namespace AWS.Logger.Core
         const int MAX_MESSAGE_SIZE_IN_BYTES = 256000;
 
         #region Private Members
+        private static readonly DateTime MIN_TIMESTAMP_UTC_KIND = new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
         const string EMPTY_MESSAGE = "\t";
         private ConcurrentQueue<InputLogEvent> _pendingMessageQueue = new ConcurrentQueue<InputLogEvent>();
-        private string _currentStreamName = null;
+        private string? _currentStreamName = null;
         private LogEventBatch _repo = new LogEventBatch();
-        private CancellationTokenSource _cancelStartSource;
-        private SemaphoreSlim _flushTriggerEvent;
-        private ManualResetEventSlim _flushCompletedEvent;
+        private CancellationTokenSource? _cancelStartSource;
+        private SemaphoreSlim? _flushTriggerEvent;
+        private ManualResetEventSlim? _flushCompletedEvent;
         private AWSLoggerConfig _config;
         private IAmazonCloudWatchLogs _client;
-        private DateTime _maxBufferTimeStamp = new DateTime();
+
+        /// <summary>
+        /// Last time an error message was registered due to overflowing in-memory buffer.
+        /// </summary>
+        private DateTime _maxBufferTimeStamp = MIN_TIMESTAMP_UTC_KIND;
         private string _logType;
         private int _requestCount = 5;
+
+        /// <summary>
+        /// Minimum interval in minutes between two error messages on in-memory buffer overflow.
+        /// </summary>
         const double MAX_BUFFER_TIMEDIFF = 5;
         private readonly static Regex invalid_sequence_token_regex = new
             Regex(@"The given sequenceToken is invalid. The next expected sequenceToken is: (\d+)");
@@ -48,7 +60,7 @@ namespace AWS.Logger.Core
         /// </summary>
         public sealed class LogLibraryEventArgs : EventArgs
         {
-            internal LogLibraryEventArgs(Exception ex)
+            internal LogLibraryEventArgs(Exception? ex)
             {
                 Exception = ex;
             }
@@ -56,18 +68,18 @@ namespace AWS.Logger.Core
             /// <summary>
             /// Exception Details returned
             /// </summary>
-            public Exception Exception { get; }
+            public Exception? Exception { get; }
 
             /// <summary>
             /// Service EndPoint Url involved
             /// </summary>
-            public string ServiceUrl { get; internal set; }
+            public string? ServiceUrl { get; internal set; }
         }
 
         /// <summary>
         /// Event Notification on alerts from the CloudWatch Log Engine
         /// </summary>
-        public event EventHandler<LogLibraryEventArgs> LogLibraryAlert;
+        public event EventHandler<LogLibraryEventArgs>? LogLibraryAlert;
 
         /// <summary>
         /// Construct an instance of AWSLoggerCore
@@ -104,8 +116,8 @@ namespace AWS.Logger.Core
             ((AmazonCloudWatchLogsClient)this._client).BeforeRequestEvent += ServiceClientBeforeRequestEvent;
             ((AmazonCloudWatchLogsClient)this._client).ExceptionEvent += ServiceClienExceptionEvent;
 
-            StartMonitor();
-            RegisterShutdownHook();
+            this.StartMonitor();
+            this.RegisterShutdownHook();
         }
 
 
@@ -127,7 +139,7 @@ namespace AWS.Logger.Core
             AppDomain.CurrentDomain.ProcessExit += ProcessExit;
         }
 
-        private void ProcessExit(object sender, EventArgs e)
+        private void ProcessExit(object? sender, EventArgs e)
         {
             Close();
         }
@@ -148,7 +160,7 @@ namespace AWS.Logger.Core
             return FallbackCredentialsFactory.GetCredentials();
         }
 
-        private static AWSCredentials LookupCredentialsFromProfileStore(AWSLoggerConfig config)
+        private static AWSCredentials? LookupCredentialsFromProfileStore(AWSLoggerConfig config)
         {
             var credentialProfileStore = string.IsNullOrEmpty(config.ProfilesLocation)
                 ? new CredentialProfileStoreChain()
@@ -165,7 +177,7 @@ namespace AWS.Logger.Core
             try
             {
                 Flush();
-                _cancelStartSource.Cancel();
+                _cancelStartSource?.Cancel();
             }
             catch (Exception ex)
             {
@@ -180,6 +192,9 @@ namespace AWS.Logger.Core
         /// <inheritdoc />
         public void Flush()
         {
+            if (_cancelStartSource == null)
+                throw new InvantiveSystemException(GlobalState.ForAuto(), null, MessageCodes.itgenale017, "Start Source not called before Cancellation Request");
+
             if (_cancelStartSource.IsCancellationRequested)
                 return;
 
@@ -188,8 +203,14 @@ namespace AWS.Logger.Core
                 bool lockTaken = false;
                 try
                 {
+                    if (_flushTriggerEvent == null)
+                        throw new InvantiveSystemException(GlobalState.ForAuto(), null, MessageCodes.itgenale015, "Start monitor not called before flush.");
+                    
+
                     // Ensure only one thread executes the flush operation
                     System.Threading.Monitor.TryEnter(_flushTriggerEvent, ref lockTaken);
+                    if (_flushCompletedEvent == null)
+                        throw new InvantiveSystemException(GlobalState.ForAuto(), null, MessageCodes.itgenale018, "Complete monitor not called before flush.");
                     if (lockTaken)
                     {
                         _flushCompletedEvent.Reset();
@@ -214,6 +235,11 @@ namespace AWS.Logger.Core
                 }
                 finally
                 {
+                    if (_flushTriggerEvent == null)
+                    {
+                        throw new InvantiveSystemException(GlobalState.ForAuto(), null, MessageCodes.itgenale016, "Start monitor not called before flush.");
+                    }
+
                     if (lockTaken)
                         System.Threading.Monitor.Exit(_flushTriggerEvent);
                 }
@@ -234,33 +260,33 @@ namespace AWS.Logger.Core
             }
         }
 
-        private void AddSingleMessage(string message)
+        private void AddSingleMessage(string message, DateTime? timestamp)
         {
+            DateTime timestampNn = timestamp ?? DateTime.Now;
+
             if (_pendingMessageQueue.Count > _config.MaxQueuedMessages)
             {
                 if (_maxBufferTimeStamp.AddMinutes(MAX_BUFFER_TIMEDIFF) < DateTime.UtcNow)
                 {
-                    message = "The AWS Logger in-memory buffer has reached maximum capacity";
-                    if (_maxBufferTimeStamp == DateTime.MinValue)
+                    if (_maxBufferTimeStamp == MIN_TIMESTAMP_UTC_KIND)
                     {
+                        string errorMessage = $"The AWS Logger in-memory buffer has reached maximum capacity of {_config.MaxQueuedMessages:N0} entries. Currently contains {_pendingMessageQueue.Count:N0} entries.";
                         LogLibraryServiceError(new System.InvalidOperationException(message));
+                        _pendingMessageQueue.Enqueue(new InputLogEvent
+                        {
+                            Timestamp = timestampNn,
+                            Message = errorMessage
+                        });
                     }
                     _maxBufferTimeStamp = DateTime.UtcNow;
-                    _pendingMessageQueue.Enqueue(new InputLogEvent
-                    {
-                        Timestamp = DateTime.Now,
-                        Message = message,
-                    });
                 }
             }
-            else
+
+            _pendingMessageQueue.Enqueue(new InputLogEvent
             {
-                _pendingMessageQueue.Enqueue(new InputLogEvent
-                {
-                    Timestamp = DateTime.Now,
-                    Message = message,
-                });
-            }
+                Timestamp = timestampNn,
+                Message = message,
+            });
         }
 
         /// <summary>
@@ -268,7 +294,8 @@ namespace AWS.Logger.Core
         /// the logger
         /// </summary>
         /// <param name="rawMessage"></param>
-        public void AddMessage(string rawMessage)
+        /// <param name="timestamp"></param>
+        public void AddMessage(string rawMessage, DateTime? timestamp = null)
         {
             if (string.IsNullOrEmpty(rawMessage))
             {
@@ -280,14 +307,14 @@ namespace AWS.Logger.Core
             // typically small messages.
             if (Encoding.Unicode.GetMaxByteCount(rawMessage.Length) < MAX_MESSAGE_SIZE_IN_BYTES)
             {
-                AddSingleMessage(rawMessage);
+                AddSingleMessage(rawMessage, timestamp);
             }
             else
             {
                 var messageParts = BreakupMessage(rawMessage);
                 foreach (var message in messageParts)
                 {
-                    AddSingleMessage(message);
+                    AddSingleMessage(message, timestamp);
                 }
             }
         }
@@ -372,8 +399,14 @@ namespace AWS.Logger.Core
                         await SendMessages(token).ConfigureAwait(false);
                     }
 
+                    if (_flushCompletedEvent == null)
+                        throw new InvantiveSystemException(GlobalState.ForAuto(), null, MessageCodes.itgenale018, "Complete monitor not called before flush.");
+
                     if (executeFlush)
                         _flushCompletedEvent.Set();
+
+                    if (_flushTriggerEvent == null)
+                        throw new InvantiveSystemException(GlobalState.ForAuto(), null, MessageCodes.itgenale015, "Start monitor not called before flush.");
 
                     executeFlush = await _flushTriggerEvent.WaitAsync(TimeSpan.FromMilliseconds(_config.MonitorSleepTime.TotalMilliseconds), token);
                 }
@@ -419,7 +452,6 @@ namespace AWS.Logger.Core
                 //In case the NextSequenceToken is invalid for the last sent message, a new stream would be 
                 //created for the said application.
                 LogLibraryServiceError(ex);
-
                 if (_requestCount > 0)
                 {
                     _requestCount--;
@@ -434,13 +466,6 @@ namespace AWS.Logger.Core
                 {
                     _currentStreamName = await LogEventTransmissionSetup(token).ConfigureAwait(false);
                 }
-            }
-            catch (ResourceNotFoundException ex)
-            {
-                // The specified log stream does not exist. Refresh or create new stream.
-                LogLibraryServiceError(ex);
-
-                _currentStreamName = await LogEventTransmissionSetup(token).ConfigureAwait(false);
             }
         }
 
@@ -458,6 +483,7 @@ namespace AWS.Logger.Core
                 {
                     LogGroupNamePrefix = _config.LogGroup
                 }, token).ConfigureAwait(false);
+
                 if (!IsSuccessStatusCode(logGroupResponse))
                 {
                     LogLibraryServiceError(new System.Net.WebException($"Lookup LogGroup {_config.LogGroup} returned status: {logGroupResponse.HttpStatusCode}"), serviceURL);
@@ -473,16 +499,30 @@ namespace AWS.Logger.Core
                 }
             }
 
-            var currentStreamName = GenerateStreamName(_config);
+            string currentStreamName = GenerateStreamName(_config);
 
-            var streamResponse = await _client.CreateLogStreamAsync(new CreateLogStreamRequest
+            CreateLogStreamResponse? streamResponse;
+
+            try
             {
-                LogGroupName = _config.LogGroup,
-                LogStreamName = currentStreamName
-            }, token).ConfigureAwait(false);
-            if (!IsSuccessStatusCode(streamResponse))
+                streamResponse = await _client.CreateLogStreamAsync(new CreateLogStreamRequest
+                {
+                    LogGroupName = _config.LogGroup,
+                    LogStreamName = currentStreamName
+                }, token).ConfigureAwait(false);
+            }
+            catch (ResourceAlreadyExistsException)
             {
-                LogLibraryServiceError(new System.Net.WebException($"Create LogStream {currentStreamName} for LogGroup {_config.LogGroup} returned status: {streamResponse.HttpStatusCode}"), serviceURL);
+                // Ignore error, log stream already exists.
+                streamResponse = null;
+            }
+
+            if (streamResponse != null)
+            {
+                if (!IsSuccessStatusCode(streamResponse))
+                {
+                    LogLibraryServiceError(new System.Net.WebException($"Create LogStream {currentStreamName} for LogGroup {_config.LogGroup} returned status: {streamResponse.HttpStatusCode}"), serviceURL);
+                }
             }
 
             _repo = new LogEventBatch(_config.LogGroup, currentStreamName, Convert.ToInt32(_config.BatchPushInterval.TotalSeconds), _config.BatchSizeInBytes);
@@ -502,10 +542,12 @@ namespace AWS.Logger.Core
             if (!string.IsNullOrEmpty(prefix))
             {
                 streamName.Append(prefix);
-                streamName.Append(" - ");
             }
-
-            streamName.Append(DateTime.Now.ToString("yyyy/MM/ddTHH.mm.ss"));
+            //
+            // Not needed, our suffix is already rather unique.
+            //
+            //streamName.Append(" - ");
+            //streamName.Append(DateTime.Now.ToString("yyyy/MM/ddTHH.mm.ss"));
 
             var suffix = config.LogStreamNameSuffix;
             if (!string.IsNullOrEmpty(suffix))
@@ -513,7 +555,6 @@ namespace AWS.Logger.Core
                 streamName.Append(" - ");
                 streamName.Append(suffix);
             }
-
 
             return streamName.ToString();
         }
@@ -585,7 +626,7 @@ namespace AWS.Logger.Core
             int _totalMessageSize { get; set; }
             DateTime _nextPushTime;
             public PutLogEventsRequest _request = new PutLogEventsRequest();
-            public LogEventBatch(string logGroupName, string streamName, int timeIntervalBetweenPushes, int maxBatchSize)
+            public LogEventBatch(string? logGroupName, string streamName, int timeIntervalBetweenPushes, int maxBatchSize)
             {
                 _request.LogGroupName = logGroupName;
                 _request.LogStreamName = streamName;
@@ -622,7 +663,7 @@ namespace AWS.Logger.Core
                 _request.LogEvents.Add(ev);
             }
 
-            public void Reset(string SeqToken)
+            public void Reset(string? SeqToken)
             {
                 _request.LogEvents.Clear();
                 _totalMessageSize = 0;
@@ -645,39 +686,96 @@ namespace AWS.Logger.Core
         {
             var eventArgs = e as WebServiceExceptionEventArgs;
             if (eventArgs?.Exception != null)
-                LogLibraryServiceError(eventArgs?.Exception, eventArgs.Endpoint?.ToString());
+                LogLibraryServiceError(eventArgs.Exception, eventArgs.Endpoint?.ToString());
             else
                 LogLibraryServiceError(new System.Net.WebException(e.GetType().ToString()));
         }
 
-        private void LogLibraryServiceError(Exception ex, string serviceUrl = null)
+        private static readonly GlobalState ownerLog = GlobalState.ForMethod(nameof(LogLibraryServiceError));
+
+        private void LogLibraryServiceError(Exception? ex, string? serviceUrl = null)
         {
             LogLibraryAlert?.Invoke(this, new LogLibraryEventArgs(ex) { ServiceUrl = serviceUrl ?? GetServiceUrl() });
-            if (!string.IsNullOrEmpty(_config.LibraryLogFileName) && _config.LibraryLogErrors)
+            if (!string.IsNullOrEmpty(_config.LibraryLogFileNamePath))
             {
-                LogLibraryError(ex, _config.LibraryLogFileName);
+                LogLibraryError(ex, _config.LibraryLogFileNamePath);
             }
+
+            string messageCode = ex?.GetMessageCode(ownerLog, null, MessageCodes.itgenale019) ?? MessageCodes.itgenale020;
+            InvantiveTrace.WriteLine(ownerLog, null, $"AWS Logger: {ex}", messageCode);
         }
 
         /// <summary>
         /// Write Exception details to the file specified with the filename
         /// </summary>
-        public static void LogLibraryError(Exception ex, string LibraryLogFileName)
+        public static void LogLibraryError(Exception? ex, string LibraryLogFileName)
         {
             try
             {
-                using (StreamWriter w = File.AppendText(LibraryLogFileName))
-                {
-                    w.WriteLine("Log Entry : ");
-                    w.WriteLine("{0}", DateTime.Now.ToString());
-                    w.WriteLine("  :");
-                    w.WriteLine("  :{0}", ex.ToString());
-                    w.WriteLine("-------------------------------");
-                }
+                StringBuilder sb = new StringBuilder(512);
+
+                sb.AppendLine("Log Entry : ");
+
+                sb.AppendLine(DateTime.Now.ToString());
+
+                sb.AppendLine("  :");
+
+                sb.Append("  :");
+                sb.AppendLine(ex.ToString());
+
+                sb.AppendLine("-------------------------------");
+
+                WriteToFile(LibraryLogFileName, sb.ToString());
             }
             catch (Exception e)
             {
                 Console.WriteLine("Exception caught when writing error log to file" + e.ToString());
+            }
+        }
+
+        static ReaderWriterLock locker = new ReaderWriterLock();
+
+        private static void WriteToFile(string fileName, string text)
+        {
+            const int TRY_SLEEP_INTERVAL_MS = 50;
+            const int MAX_TRIES = 25;
+
+            bool written = false;
+            int tries = 0;
+
+            while (!written)
+            {
+                try
+                {
+                    tries++;
+
+                    locker.AcquireWriterLock(int.MaxValue);
+
+                    using (StreamWriter w = File.AppendText(fileName))
+                    {
+                        w.Write(text);
+                    }
+
+                    written = true;
+                }
+                catch (IOException)
+                {
+                    //
+                    // Failed. Try again after some time.
+                    //
+                    if (tries < MAX_TRIES)
+                    {
+                        Thread.Sleep(TRY_SLEEP_INTERVAL_MS);
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+                finally
+                {
+                    locker.ReleaseWriterLock();
+                }
             }
         }
     }
