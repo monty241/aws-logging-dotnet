@@ -26,6 +26,8 @@ namespace AWS.Logger.Core
         const int MAX_MESSAGE_SIZE_IN_BYTES = 256000;
 
         #region Private Members
+        private static readonly DateTime MIN_TIMESTAMP_UTC_KIND = new DateTime(1, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
         const string EMPTY_MESSAGE = "\t";
         private ConcurrentQueue<InputLogEvent> _pendingMessageQueue = new ConcurrentQueue<InputLogEvent>();
         private string _currentStreamName = null;
@@ -35,9 +37,17 @@ namespace AWS.Logger.Core
         private ManualResetEventSlim _flushCompletedEvent;
         private AWSLoggerConfig _config;
         private IAmazonCloudWatchLogs _client;
-        private DateTime _maxBufferTimeStamp = new DateTime();
+
+        /// <summary>
+        /// Last time an error message was registered due to overflowing in-memory buffer.
+        /// </summary>
+        private DateTime _maxBufferTimeStamp = MIN_TIMESTAMP_UTC_KIND;
         private string _logType;
         private int _requestCount = 5;
+
+        /// <summary>
+        /// Minimum interval in minutes between two error messages on in-memory buffer overflow.
+        /// </summary>
         const double MAX_BUFFER_TIMEDIFF = 5;
         private readonly static Regex invalid_sequence_token_regex = new
             Regex(@"The given sequenceToken is invalid. The next expected sequenceToken is: (\d+)");
@@ -242,29 +252,21 @@ namespace AWS.Logger.Core
             {
                 if (_maxBufferTimeStamp.AddMinutes(MAX_BUFFER_TIMEDIFF) < DateTime.UtcNow)
                 {
-                    message = "The AWS Logger in-memory buffer has reached maximum capacity";
-                    if (_maxBufferTimeStamp == DateTime.MinValue)
+                    if (_maxBufferTimeStamp == MIN_TIMESTAMP_UTC_KIND)
                     {
+                        string errorMessage = $"The AWS Logger in-memory buffer has reached maximum capacity of {_config.MaxQueuedMessages:N0} entries. Currently contains {_pendingMessageQueue.Count:N0} entries.";
                         LogLibraryServiceError(new System.InvalidOperationException(message));
+                        _pendingMessageQueue.Enqueue(new InputLogEvent
+                        {
+                            Timestamp = timestampNn,
+                            Message = errorMessage
+                        });
                     }
                     _maxBufferTimeStamp = DateTime.UtcNow;
-                    _pendingMessageQueue.Enqueue(new InputLogEvent
-                    {
-                        Timestamp = timestampNn,
-                        Message = message,
-                    });
                 }
             }
-            else
-            {
-                _pendingMessageQueue.Enqueue(new InputLogEvent
-                {
-                    Timestamp = timestampNn,
-                    Message = message,
-                });
-            }
         }
-
+        
         /// <summary>
         /// A Concurrent Queue is used to store the messages from 
         /// the logger
